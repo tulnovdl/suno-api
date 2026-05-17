@@ -20,6 +20,20 @@ globalForSunoApi.sunoApiCache = cache;
 const logger = pino();
 export const DEFAULT_MODEL = 'chirp-v3-5';
 
+// Tracking/consent cookies that have values Chromium's Network.setCookies rejects
+// (raw `+`, commas, etc.). They are not needed for Suno auth and would otherwise
+// fail Playwright `context.addCookies`, so we drop them by name before the
+// browser ever sees them. Configurable via SUNO_COOKIE_BLOCKLIST (comma-separated).
+const DEFAULT_COOKIE_BLOCKLIST = ['OptanonConsent'];
+
+function getCookieBlocklist(): Set<string> {
+  const fromEnv = (process.env.SUNO_COOKIE_BLOCKLIST || '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean);
+  return new Set(fromEnv.length ? fromEnv : DEFAULT_COOKIE_BLOCKLIST);
+}
+
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
   title?: string; // Title of the audio
@@ -84,7 +98,20 @@ class SunoApi {
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
-    this.cookies = cookie.parse(cookies);
+    const parsed = cookie.parse(cookies);
+    const blocklist = getCookieBlocklist();
+    const filtered: Record<string, string | undefined> = {};
+    const dropped: string[] = [];
+    for (const [key, value] of Object.entries(parsed)) {
+      if (blocklist.has(key)) {
+        dropped.push(key);
+        continue;
+      }
+      filtered[key] = value;
+    }
+    if (dropped.length)
+      logger.info(`Dropped ${dropped.length} blocklisted cookie name(s): ${dropped.join(', ')}`);
+    this.cookies = filtered;
     this.deviceId = this.cookies.ajs_anonymous_id || randomUUID();
     this.client = axios.create({
       withCredentials: true,
@@ -308,30 +335,89 @@ class SunoApi {
     if (!await this.captchaRequired())
       return null;
 
+    // Escape hatch: skip browser/2captcha flow entirely for accounts where the
+    // server-side captcha gate is informational and the /api/generate/v2/
+    // request still succeeds without a token. Useful while the upstream UI is
+    // changing faster than we can patch the captcha automation.
+    if ((process.env.SUNO_SKIP_CAPTCHA || '').toLowerCase() === 'true') {
+      logger.info('SUNO_SKIP_CAPTCHA=true: returning null token without launching the browser');
+      return null;
+    }
+
     logger.info('CAPTCHA required. Launching browser...')
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
     await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
 
     logger.info('Waiting for Suno interface to load');
-    // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
-    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
+    // Best-effort wait for the song list API call. Suno periodically renames
+    // these endpoints, so we tolerate a timeout here and let the textarea
+    // visibility check below be the authoritative readiness signal.
+    try {
+      await page.waitForResponse('**/api/project/**\\?**', { timeout: 30000 });
+    } catch (e) {
+      logger.info('Suno /api/project/ probe timed out; relying on UI selector readiness instead');
+    }
 
     if (this.ghostCursorEnabled)
       this.cursor = await createCursor(page);
     
     logger.info('Triggering the CAPTCHA');
+    // Dismiss the OneTrust cookie consent banner that overlays the page when
+    // OptanonConsent was blocklisted. We try both Accept and Reject buttons,
+    // and also drop the banner via CSS as a last resort so it cannot intercept
+    // pointer events on the Create button.
+    try {
+      await page.locator('#onetrust-accept-btn-handler, #onetrust-reject-all-handler').first()
+        .click({ force: true, timeout: 3000 });
+      logger.info('Dismissed OneTrust banner');
+    } catch (e) {}
+    try {
+      await page.addStyleTag({ content: '#onetrust-consent-sdk, #onetrust-banner-sdk { display: none !important; }' });
+    } catch (e) {}
     try {
       await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-      // await this.click(page, { x: 318, y: 13 });
     } catch(e) {}
 
-    const textarea = page.locator('.custom-textarea');
+    // Selectors are configurable via env so future Suno UI tweaks can be patched
+    // without a rebuild. Defaults track the 2026-05 Suno Create UI: the page
+    // mounts both Simple-mode and Advanced-mode textareas in the DOM but hides
+    // the inactive ones with `visibility: hidden`, so we explicitly pick the
+    // visible one. The Create button has aria-label "Create song".
+    const textareaSelector = process.env.SUNO_LYRICS_TEXTAREA_SELECTOR
+      || 'textarea:visible';
+    const buttonSelector = process.env.SUNO_CREATE_BUTTON_SELECTOR
+      || 'button[aria-label="Create song"], button[aria-label="Create"]';
+    const selectorTimeout = Number(process.env.SUNO_SELECTOR_TIMEOUT_MS || 60000);
+
+    const textarea = page.locator(textareaSelector).first();
+    try {
+      await textarea.waitFor({ state: 'visible', timeout: selectorTimeout });
+    } catch (e) {
+      throw new Error(`Suno Create textarea not found within ${selectorTimeout}ms. Selector: ${textareaSelector}`);
+    }
     await this.click(textarea);
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
 
-    const button = page.locator('button[aria-label="Create"]').locator('div.flex');
-    this.click(button);
+    const button = page.locator(buttonSelector).first();
+    try {
+      await button.waitFor({ state: 'visible', timeout: selectorTimeout });
+    } catch (e) {
+      throw new Error(`Suno Create button not found within ${selectorTimeout}ms. Selector: ${buttonSelector}`);
+    }
+    logger.info(`Clicking Create on ${page.url()}`);
+    await this.click(button);
+    logger.info('Create button clicked, waiting for hCaptcha to load');
+
+    // Diagnostic: snapshot page state at +3s so we can tell whether the click
+    // actually navigated/triggered something or was eaten by an overlay.
+    setTimeout(async () => {
+      try {
+        const u = page.url();
+        const captchaIframes = await page.locator('iframe[title*="hCaptcha"]').count();
+        logger.info(`+3s after click: url=${u} hCaptchaIframes=${captchaIframes}`);
+      } catch (e) {}
+    }, 3000);
 
     const controller = new AbortController();
     new Promise<void>(async (resolve, reject) => {

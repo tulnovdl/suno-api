@@ -35,17 +35,47 @@ export const isPage = (target: any): target is Page => {
  * @param signal `const controller = new AbortController(); controller.status`
  * @returns {Promise<void>} 
  */
+// Matches hCaptcha image/challenge requests. Suno now proxies hCaptcha through
+// `hcaptcha-(imgs|assets|endpoint)-<env>.suno.com`, so the original
+// `img*.hcaptcha.com` pattern no longer fires. Configurable via env so future
+// proxy renames can be patched without a rebuild.
+const DEFAULT_HCAPTCHA_REQUEST_REGEX =
+  /^https:\/\/(?:img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-(?:imgs|assets|endpoint)[a-z0-9-]*\.suno\.com)\//i;
+
+function getHcaptchaRequestRegex(): RegExp {
+  const fromEnv = process.env.SUNO_HCAPTCHA_REQUEST_REGEX;
+  if (!fromEnv) return DEFAULT_HCAPTCHA_REQUEST_REGEX;
+  try {
+    return new RegExp(fromEnv, 'i');
+  } catch (e) {
+    logger.warn(`Invalid SUNO_HCAPTCHA_REQUEST_REGEX, using default. Error: ${(e as Error).message}`);
+    return DEFAULT_HCAPTCHA_REQUEST_REGEX;
+  }
+}
+
 export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const urlPattern = /^https:\/\/img[a-zA-Z0-9]*\.hcaptcha\.com\/.*$/;
+    const urlPattern = getHcaptchaRequestRegex();
+    const debug = (process.env.SUNO_DEBUG_REQUESTS || '').toLowerCase() === 'true';
     let timeoutHandle: NodeJS.Timeout | null = null;
     let activeRequestCount = 0;
     let requestOccurred = false;
+    let nonMatchingSample = 0;
 
     const cleanupListeners = () => {
       page.off('request', onRequest);
+      page.off('request', onAnyRequest);
       page.off('requestfinished', onRequestFinished);
       page.off('requestfailed', onRequestFinished);
+    };
+
+    const onAnyRequest = (request: { url: () => string }) => {
+      const u = request.url();
+      const matched = urlPattern.test(u);
+      if (debug && (matched || nonMatchingSample < 25)) {
+        if (!matched) nonMatchingSample++;
+        logger.info(`[waitForRequests] ${matched ? 'MATCH  ' : 'skip   '} ${u.slice(0, 220)}`);
+      }
     };
 
     const resetTimeout = () => {
@@ -88,6 +118,7 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
     }, 60000); // 1 minute timeout
 
     page.on('request', onRequest);
+    if (debug) page.on('request', onAnyRequest);
     page.on('requestfinished', onRequestFinished);
     page.on('requestfailed', onRequestFinished);
 
