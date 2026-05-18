@@ -18,7 +18,7 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-v3-5';
+export const DEFAULT_MODEL = process.env.SUNO_DEFAULT_MODEL || 'chirp-fenix';
 
 // Tracking/consent cookies that have values Chromium's Network.setCookies rejects
 // (raw `+`, commas, etc.). They are not needed for Suno auth and would otherwise
