@@ -26,9 +26,17 @@ export async function POST(req: NextRequest) {
         }
       });
     } catch (error: any) {
-      console.error('Error generating custom audio:', error);
-      return new NextResponse(JSON.stringify({ error: error.response?.data?.detail || error.toString() }), {
-        status: error.response?.status || 500,
+      const status = error.response?.status || 500;
+      const providerError = error.response?.data || {};
+      const safeError = {
+        error: providerError.detail || error.toString(),
+        error_type: providerError.error_type,
+        detail_fallback: providerError.detail_fallback,
+        status_code: providerError.status_code || status,
+      };
+      console.error('Error generating custom audio:', safeError);
+      return new NextResponse(JSON.stringify(safeError), {
+        status,
         headers: {
           'Content-Type': 'application/json',
           ...corsHeaders

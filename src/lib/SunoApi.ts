@@ -399,6 +399,44 @@ class SunoApi {
     await this.click(textarea);
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
 
+    const controller = new AbortController();
+    let resolveToken: (token: string) => void = () => {};
+    let rejectToken: (reason?: any) => void = () => {};
+    const tokenPromise: Promise<string> = new Promise((resolve, reject) => {
+      resolveToken = resolve;
+      rejectToken = reject;
+    });
+    const captchaTimeoutMs = Number(process.env.SUNO_CAPTCHA_TIMEOUT_MS || 240000);
+    const timeoutHandle = setTimeout(() => {
+      controller.abort();
+      browser.browser()?.close();
+      rejectToken(new Error(`Suno CAPTCHA flow did not return a token within ${captchaTimeoutMs}ms.`));
+    }, captchaTimeoutMs);
+    await page.route('**/api/generate/v2/**', async (route: any) => {
+      try {
+        logger.info('Suno web UI attempted /api/generate/v2/ during CAPTCHA flow. Aborting request.');
+        await route.abort();
+        browser.browser()?.close();
+        controller.abort();
+        const request = route.request();
+        const postData = request.postDataJSON();
+        const token = postData?.token;
+        if (!token) {
+          rejectToken(new Error('Suno CAPTCHA trigger submitted /api/generate/v2/ without a token; aborted before dummy generation.'));
+          return;
+        }
+        const authorization = request.headers().authorization || '';
+        const bearer = authorization.includes('Bearer ')
+          ? authorization.split('Bearer ').pop()
+          : authorization;
+        if (bearer)
+          this.currentToken = bearer;
+        resolveToken(token);
+      } catch(err) {
+        rejectToken(err);
+      }
+    });
+
     const button = page.locator(buttonSelector).first();
     try {
       await button.waitFor({ state: 'visible', timeout: selectorTimeout });
@@ -419,7 +457,6 @@ class SunoApi {
       } catch (e) {}
     }, 3000);
 
-    const controller = new AbortController();
     new Promise<void>(async (resolve, reject) => {
       const frame = page.frameLocator('iframe[title*="hCaptcha"]');
       const challenge = frame.locator('.challenge-container');
@@ -494,24 +531,19 @@ class SunoApi {
           reject(e);
       }
     }).catch(e => {
+      controller.abort();
       browser.browser()?.close();
-      throw e;
+      rejectToken(e);
     });
-    return (new Promise((resolve, reject) => {
-      page.route('**/api/generate/v2/**', async (route: any) => {
-        try {
-          logger.info('hCaptcha token received. Closing browser');
-          route.abort();
-          browser.browser()?.close();
-          controller.abort();
-          const request = route.request();
-          this.currentToken = request.headers().authorization.split('Bearer ').pop();
-          resolve(request.postDataJSON().token);
-        } catch(err) {
-          reject(err);
-        }
-      });
-    }));
+    try {
+      return await tokenPromise;
+    } finally {
+      clearTimeout(timeoutHandle);
+      controller.abort();
+      try {
+        await browser.browser()?.close();
+      } catch (e) {}
+    }
   }
 
   /**
@@ -651,8 +683,7 @@ class SunoApi {
       generation_type: 'TEXT',
       continue_at: continue_at,
       continue_clip_id: continue_clip_id,
-      task: task,
-      token: await this.getCaptcha()
+      task: task
     };
     if (isCustom) {
       payload.tags = tags;
@@ -662,30 +693,24 @@ class SunoApi {
     } else {
       payload.gpt_description_prompt = prompt;
     }
-    logger.info(
-      'generateSongs payload:\n' +
-        JSON.stringify(
-          {
-            prompt: prompt,
-            isCustom: isCustom,
-            tags: tags,
-            title: title,
-            make_instrumental: make_instrumental,
-            wait_audio: wait_audio,
-            negative_tags: negative_tags,
-            payload: payload
-          },
-          null,
-          2
-        )
-    );
-    const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
-      payload,
-      {
-        timeout: 10000 // 10 seconds timeout
+    this.logGenerateSongsPayload(prompt, isCustom, tags, title, make_instrumental, wait_audio, negative_tags, payload);
+    let response;
+    try {
+      response = await this.postGenerateSongsPayload(payload);
+    } catch (error: any) {
+      if (!this.isTokenValidationFailed(error)
+        || (process.env.SUNO_SKIP_CAPTCHA || '').toLowerCase() === 'true') {
+        throw error;
       }
-    );
+      logger.info('Tokenless generation failed token validation. Falling back to CAPTCHA token.');
+      const captchaToken = await this.getCaptcha();
+      if (!captchaToken) {
+        throw new Error('Suno token validation failed and CAPTCHA flow did not return a token.');
+      }
+      payload.token = captchaToken;
+      this.logGenerateSongsPayload(prompt, isCustom, tags, title, make_instrumental, wait_audio, negative_tags, payload);
+      response = await this.postGenerateSongsPayload(payload);
+    }
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
@@ -728,6 +753,54 @@ class SunoApi {
         duration: audio.metadata.duration
       }));
     }
+  }
+
+  private async postGenerateSongsPayload(payload: any) {
+    return this.client.post(
+      `${SunoApi.BASE_URL}/api/generate/v2/`,
+      payload,
+      {
+        timeout: 10000 // 10 seconds timeout
+      }
+    );
+  }
+
+  private isTokenValidationFailed(error: any): boolean {
+    const data = error?.response?.data;
+    return error?.response?.status === 422
+      && data?.error_type === 'token_validation_failed';
+  }
+
+  private logGenerateSongsPayload(
+    prompt: string,
+    isCustom: boolean,
+    tags: string | undefined,
+    title: string | undefined,
+    make_instrumental: boolean | undefined,
+    wait_audio: boolean,
+    negative_tags: string | undefined,
+    payload: any
+  ): void {
+    logger.info(
+      'generateSongs payload:\n' +
+        JSON.stringify(
+          {
+            prompt: prompt,
+            isCustom: isCustom,
+            tags: tags,
+            title: title,
+            make_instrumental: make_instrumental,
+            wait_audio: wait_audio,
+            negative_tags: negative_tags,
+            payload: {
+              ...payload,
+              token: payload.token ? '[present]' : undefined
+            }
+          },
+          null,
+          2
+        )
+    );
   }
 
   /**
